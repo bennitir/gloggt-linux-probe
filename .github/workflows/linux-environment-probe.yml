@@ -1,0 +1,49 @@
+name: Linux environment probe
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Measure Linux resources
+        shell: bash
+        timeout-minutes: 4
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          minimum_bytes=11811160064
+          architecture="$(uname -m)"
+          os_id="$(awk -F= '$1 == "ID" {gsub(/"/, "", $2); print $2}' /etc/os-release)"
+          os_version="$(awk -F= '$1 == "VERSION_ID" {gsub(/"/, "", $2); print $2}' /etc/os-release)"
+          printf 'linux=%s architecture=%s os=%s version=%s\n' "$(uname -r)" "$architecture" "$os_id" "$os_version"
+          if [[ "$architecture" != x86_64 || "$os_id" != ubuntu || "$os_version" != 24.04 ]]; then
+            printf 'FAIL: unexpected operating system or architecture\n'
+            exit 1
+          fi
+          printf 'cpu_available=%s\n' "$(nproc)"
+          awk '/^MemTotal:/ {printf "ram_total_bytes=%.0f\n", $2 * 1024} /^MemAvailable:/ {printf "ram_available_bytes=%.0f\n", $2 * 1024}' /proc/meminfo
+          for label in workspace temporary; do
+            if [[ "$label" == workspace ]]; then
+              target="$GITHUB_WORKSPACE"
+            else
+              target="$RUNNER_TEMP"
+            fi
+            free_bytes="$(df -B1 --output=avail -- "$target" | awk 'NR == 2 {print $1}')"
+            inode_total="$(df -i --output=itotal -- "$target" | awk 'NR == 2 {print $1}')"
+            inode_free="$(df -i --output=iavail -- "$target" | awk 'NR == 2 {print $1}')"
+            if [[ ! "$free_bytes" =~ ^[0-9]+$ || ! "$inode_total" =~ ^[0-9]+$ || ! "$inode_free" =~ ^[0-9]+$ ]]; then
+              printf 'FAIL: invalid filesystem measurement\n'
+              exit 1
+            fi
+            printf '%s free_bytes=%s inodes_total=%s inodes_free=%s\n' "$label" "$free_bytes" "$inode_total" "$inode_free"
+            if (( free_bytes < minimum_bytes )); then
+              printf 'FAIL: less than 11 GiB free on %s filesystem\n' "$label"
+              exit 1
+            fi
+          done
+          printf 'PASS: resource probe only; security isolation not tested\n'
