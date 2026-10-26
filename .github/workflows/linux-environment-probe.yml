@@ -34,8 +34,8 @@ jobs:
               target="$RUNNER_TEMP"
             fi
             free_bytes="$(df -B1 --output=avail -- "$target" | awk 'NR == 2 {print $1}')"
-            inode_total="$(df -i --output=itotal -- "$target" | awk 'NR == 2 {print $1}')"
-            inode_free="$(df -i --output=iavail -- "$target" | awk 'NR == 2 {print $1}')"
+            inode_total="$(df --output=itotal -- "$target" | awk 'NR == 2 {print $1}')"
+            inode_free="$(df --output=iavail -- "$target" | awk 'NR == 2 {print $1}')"
             if [[ ! "$free_bytes" =~ ^[0-9]+$ || ! "$inode_total" =~ ^[0-9]+$ || ! "$inode_free" =~ ^[0-9]+$ ]]; then
               printf 'FAIL: invalid filesystem measurement\n'
               exit 1
