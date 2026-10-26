@@ -1,0 +1,118 @@
+name: Rootless prerequisites only
+on:
+  workflow_dispatch:
+permissions: {}
+jobs:
+  inspect:
+    if: github.repository == 'bennitir/gloggt-linux-probe'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Inspect cgroup delegation and transient namespaces
+        shell: bash
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          /usr/bin/env -i PATH=/usr/bin:/bin LANG=C.UTF-8 /usr/bin/python3 -I -B - <<'PYTHON'
+          import errno, json, os, platform, stat, subprocess, sys
+          from pathlib import Path
+          
+          if platform.system() != "Linux" or platform.machine() != "x86_64" or os.geteuid() == 0:
+              print("STOP_EXPECTED_NONROOT_LINUX_X64")
+              sys.exit(1)
+          
+          # Read existing state only; do not create cgroups or enable controllers.
+          candidate, uncertain = False, False
+          try:
+              base = Path("/sys/fs/cgroup")
+              if not (base / "cgroup.controllers").is_file():
+                  print("CGROUP_V2_NOT_AVAILABLE")
+              else:
+                  member = next(s[3:] for s in Path("/proc/self/cgroup").read_text().splitlines()
+                                if s.startswith("0::"))
+                  current = (base / member.lstrip("/")).resolve()
+                  if not current.is_relative_to(base):
+                      raise ValueError("invalid-cgroup-path")
+                  for path in (current, *current.parents):
+                      if path == base:
+                          break
+                      try:
+                          delegated = os.getxattr(path, "user.delegate") == b"1"
+                          enabled = set((path / "cgroup.subtree_control").read_text().split())
+                          writable = os.access(path, os.W_OK | os.X_OK, effective_ids=True)
+                          writable = writable and os.access(path / "cgroup.procs", os.W_OK,
+                                                           effective_ids=True)
+                          candidate |= delegated and {"memory", "pids"} <= enabled and writable
+                      except OSError as exc:
+                          if exc.errno not in (errno.ENODATA, errno.ENOENT):
+                              uncertain = True
+                  print("CGROUP_CANDIDATE_FOUND" if candidate else
+                        "CGROUP_READ_INCONCLUSIVE" if uncertain else
+                        "CGROUP_NO_MATCH_FOR_EXISTING_LAUNCHER")
+          except (OSError, ValueError, StopIteration):
+              uncertain = True
+              print("CGROUP_READ_INCONCLUSIVE")
+          
+          for label, path in (
+              ("userns_max", "/proc/sys/user/max_user_namespaces"),
+              ("userns_clone", "/proc/sys/kernel/unprivileged_userns_clone"),
+              ("apparmor_userns_restriction", "/proc/sys/kernel/apparmor_restrict_unprivileged_userns"),
+          ):
+              try:
+                  value = Path(path).read_text().strip()
+                  print(label + "=" + (value if value.isdigit() else "unknown"))
+              except OSError:
+                  print(label + "=unreadable_or_absent")
+          
+          # Harmless, short-lived namespace processes only: no mounts, files or settings.
+          # This tests unshare's AppArmor context, not a future bwrap-specific profile.
+          safe = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+          child = (
+              "import json,os,sys; old=json.loads(sys.argv[1]); "
+              "ok=os.geteuid()!=0 and all(os.readlink('/proc/self/ns/'+n)!=v "
+              "for n,v in old.items()); print('NAMESPACE_OK' if ok else 'NAMESPACE_MISMATCH'); "
+              "sys.exit(0 if ok else 1)"
+          )
+          namespace_ok = False
+          try:
+              binary = Path("/usr/bin/unshare")
+              mode = binary.stat()
+              if mode.st_uid != 0 or mode.st_mode & (stat.S_ISUID | stat.S_ISGID | 0o022):
+                  raise ValueError("unexpected-unshare-permissions")
+              try:
+                  if os.getxattr(binary, "security.capability"):
+                      raise ValueError("privileged-unshare-refused")
+              except OSError as exc:
+                  if exc.errno != errno.ENODATA:
+                      raise
+              cases = (
+                  ("USER_NAMESPACE", ("user",), ["--user", "--map-current-user"]),
+                  ("COMBINED_NAMESPACES", ("user", "mnt", "pid", "net", "ipc", "uts", "cgroup"),
+                   ["--user", "--map-current-user", "--mount", "--propagation", "unchanged",
+                    "--pid", "--fork", "--kill-child=KILL", "--net", "--ipc", "--uts", "--cgroup"]),
+              )
+              for label, names, options in cases:
+                  before = {name: os.readlink("/proc/self/ns/" + name) for name in names}
+                  result = subprocess.run(
+                      [str(binary), *options, "/usr/bin/python3", "-I", "-B", "-c", child,
+                       json.dumps(before)], env=safe, stdin=subprocess.DEVNULL,
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, close_fds=True, timeout=8)
+                  passed = result.returncode == 0 and result.stdout == b"NAMESPACE_OK\n" and not result.stderr
+                  print(label + ("_PASS" if passed else "_FAILED_OR_POLICY_BLOCKED"))
+                  if not passed:
+                      if label == "USER_NAMESPACE":
+                          print("COMBINED_NAMESPACES_NOT_TESTED")
+                      break
+                  namespace_ok = label == "COMBINED_NAMESPACES"
+          except (OSError, ValueError, subprocess.TimeoutExpired):
+              print("NAMESPACE_TEST_UNAVAILABLE_OR_TIMEOUT")
+          
+          if candidate and namespace_ok:
+              print("BWRAP_INSTALL_MAY_HELP; CGROUP_WRITES_AND_BWRAP_ISOLATION_STILL_UNTESTED")
+              sys.exit(0)
+          if not candidate and not uncertain:
+              print("BWRAP_ALONE_INSUFFICIENT_FOR_EXISTING_LAUNCHER; STOP_THIS_ROUTE")
+          else:
+              print("INCONCLUSIVE; DO_NOT_AUTHORIZE_INSTALL_FROM_THIS_RESULT")
+          sys.exit(1)
+          PYTHON
